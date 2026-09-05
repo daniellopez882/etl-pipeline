@@ -7,3 +7,10 @@ __pycache__/
 .idea/
 
 
+
+# Tooling
+.venv/
+.venv312/
+.pytest_cache/
+.ruff_cache/
+out/
