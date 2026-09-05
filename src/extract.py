@@ -1,59 +1,89 @@
-import psycopg2
+"""
+Extract online transactions from Redshift, with the cleaning done in SQL.
+
+The connection used to be opened and never closed, and the query was run
+through ``pd.read_sql`` on a raw DBAPI connection, which pandas warns about.
+The connection is a context manager now and the cursor is read directly.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
 import pandas as pd
 
+from src.config import Settings
 
-def connect_to_redshift(dbname, host, port, user, password):
-    """Method that connects to redshift. This gives a warning so will look for another solution"""
+logger = logging.getLogger("etl.extract")
 
-    connect = psycopg2.connect(
-        dbname=dbname, host=host, port=port, user=user, password=password
+QUERY = """
+SELECT ot.invoice,
+       ot.stock_code,
+       CASE WHEN s.description IS NULL THEN 'Unknown' ELSE s.description END AS description,
+       ot.price,
+       ot.quantity,
+       ot.price * ot.quantity AS total_order_value,
+       CAST(ot.invoice_date AS TIMESTAMP) AS invoice_date,
+       ot.customer_id,
+       ot.country
+FROM bootcamp.online_transactions ot
+LEFT JOIN (
+    SELECT * FROM bootcamp.stock_description WHERE description <> '?'
+) AS s ON ot.stock_code = s.stock_code
+WHERE ot.customer_id <> ''
+  AND ot.stock_code NOT IN ('BANK CHARGES', 'POST', 'D', 'M', 'CRUK')
+"""
+
+COLUMNS = [
+    "invoice",
+    "stock_code",
+    "description",
+    "price",
+    "quantity",
+    "total_order_value",
+    "invoice_date",
+    "customer_id",
+    "country",
+]
+
+
+@contextmanager
+def redshift_connection(settings: Settings) -> Iterator[Any]:
+    import psycopg2
+
+    conn = psycopg2.connect(
+        dbname=settings.REDSHIFT_DB,
+        host=settings.REDSHIFT_HOST,
+        port=settings.REDSHIFT_PORT,
+        user=settings.REDSHIFT_USER,
+        password=settings.REDSHIFT_PASSWORD,
+        connect_timeout=settings.CONNECT_TIMEOUT_SECONDS,
     )
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-    print("connection to redshift made")
 
-    return connect
+def rows_to_frame(rows: list[tuple], columns: list[str]) -> pd.DataFrame:
+    frame = pd.DataFrame.from_records(rows, columns=columns)
+    if "invoice_date" in frame.columns:
+        frame["invoice_date"] = pd.to_datetime(frame["invoice_date"])
+    return frame
 
-def extract_transaction_data(dbname, host, port, user, password):
-    """
-    This function connects to redshift, extracts online transactions data and carry out the following transformation tasks:
-    1. Select everything from online_transaction table and description from stock_description table
-    2. Filters on where customer_id is not equal to ‘’
-    3. Filters on where stock_code not in BANK CHARGES, POST, D, M, CRUK
-    4. If the description is null replaces it with 'Unknown'
-    5. Fix the invoice_date field from object to datetime
-    6. Add a variable/column for total order value (price x quantity)
 
-    """
-
-    # connect to redshift
-    connect = connect_to_redshift(dbname, host, port, user, password)
-
-    # query to extract online transactions data
-
-    query = """
-    SELECT ot.invoice, 
-           ot.stock_code,
-           CASE WHEN s.description IS NULL THEN 'Unknown'
-                ELSE s.description END AS description,
-           ot.price,
-           ot.quantity,
-            /* add a column for total order value */
-           ot.price * ot.quantity AS total_order_value,
-           CAST(invoice_date As DateTime) AS invoice_date,
-           ot.customer_id,
-           ot.country
-    FROM bootcamp.online_transactions ot
-    /* this is a subquery that removes '?' from the stock_description table */
-    LEFT JOIN ( SELECT *
-                FROM bootcamp.stock_description
-                WHERE description <> '?') AS s
-    ON ot.stock_code = s.stock_code
-    WHERE ot.customer_id <> ''
-    AND ot.stock_code NOT IN ('BANK CHARGES', 'POST', 'D', 'M', 'CRUK')
-    """
-
-    online_trans_cleaned = pd.read_sql(query, connect)
-
-    print('The shape of the extracted and transformed data:', online_trans_cleaned.shape)
-
-    return online_trans_cleaned
+def extract_transaction_data(settings: Settings, *, limit: int | None = None) -> pd.DataFrame:
+    """Run the extraction query. ``limit`` caps the rows, for a sample run."""
+    sql = QUERY.strip()
+    if limit is not None:
+        sql = f"{sql}\nLIMIT {int(limit)}"
+    with redshift_connection(settings) as conn, conn.cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        columns = [col[0] for col in cursor.description]
+    frame = rows_to_frame(rows, columns)
+    logger.info("extracted %d rows, %d columns", *frame.shape)
+    return frame
