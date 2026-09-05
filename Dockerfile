@@ -1,14 +1,33 @@
-# Deriving the python image
-FROM python:3.8
+# The previous image was python:3.8 (end of life), ran as root, and copied
+# the whole tree. Multi-stage on 3.12-slim, uid 10001, application files only.
+FROM python:3.12-slim AS build
 
-# Create a working directory in Docker, makes life easier when running instructions
 WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Copies all the source code into our directory to the Docker image
-COPY . /app
+COPY requirements.txt .
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --upgrade pip \
+ && /opt/venv/bin/pip install -r requirements.txt
 
-# Installs all the libraries we will need to execute the code
-RUN pip install -r requirements.txt
 
-# Tell Docker the command to run inside the container
-CMD ["python", "./main.py"]
+FROM python:3.12-slim AS runtime
+
+RUN useradd --create-home --uid 10001 etl
+
+WORKDIR /app
+COPY --from=build /opt/venv /opt/venv
+COPY --chown=etl:etl main.py ./
+COPY --chown=etl:etl src/ ./src/
+
+RUN mkdir -p /app/out && chown etl:etl /app/out
+VOLUME ["/app/out"]
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER etl
+
+# A one-shot job: the exit code is the result. --dry-run writes to /app/out.
+ENTRYPOINT ["python", "main.py"]
