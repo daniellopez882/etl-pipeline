@@ -6,6 +6,9 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `pytest` does not add the working directory to sys.path the way
+# `python -m pytest` does; without this the conftest cannot import the app.
+pythonpath = ["."]
 addopts = "-q --strict-markers"
 
 [tool.ruff]
